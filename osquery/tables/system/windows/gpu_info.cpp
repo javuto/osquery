@@ -9,6 +9,10 @@
 
 #include <boost/algorithm/string.hpp>
 
+#include <cstdio>
+#include <map>
+#include <string>
+
 #include <osquery/core/system.h>
 #include <osquery/core/tables.h>
 #include <osquery/logger/logger.h>
@@ -32,23 +36,69 @@ void parsePnpDeviceId(const std::string& pnp_id,
   model_id.clear();
 
   // The PNPDeviceID is of the form: PCI\VEN_xxxx&DEV_xxxx&SUBSYS_...
+  // VEN_ and DEV_ values are fixed-width (4 hex digits), so read them directly
+  // rather than searching for a terminating '&', which fails when the ID ends
+  // the string.
   auto vpos = pnp_id.find("VEN_");
-  if (vpos != std::string::npos) {
-    auto start = vpos + 4;
-    auto end = pnp_id.find('&', start);
-    if (end != std::string::npos) {
-      vendor_id = "0x" + pnp_id.substr(start, end - start);
-    }
+  if (vpos != std::string::npos && vpos + 8 <= pnp_id.size()) {
+    vendor_id = "0x" + pnp_id.substr(vpos + 4, 4);
   }
 
   auto dpos = pnp_id.find("DEV_");
-  if (dpos != std::string::npos) {
-    auto start = dpos + 4;
-    auto end = pnp_id.find('&', start);
-    if (end != std::string::npos) {
-      model_id = "0x" + pnp_id.substr(start, end - start);
-    }
+  if (dpos != std::string::npos && dpos + 8 <= pnp_id.size()) {
+    model_id = "0x" + pnp_id.substr(dpos + 4, 4);
   }
+}
+
+// Build a map of PNPDeviceID -> PCI bus address ("0000:bb:dd.f") from
+// Win32_PnPEntity.LocationInformation, so pci_slot carries the same bus
+// address format as the Linux implementation instead of the full PNP string.
+std::map<std::string, std::string> pciAddressByPnpId() {
+  std::map<std::string, std::string> addresses;
+
+  const auto wmiReq = WmiRequest::CreateWmiRequest(
+      "SELECT PNPDeviceID, LocationInformation FROM Win32_PnPEntity");
+  if (!wmiReq) {
+    return addresses;
+  }
+
+  for (const auto& item : wmiReq->results()) {
+    std::string pnp_id;
+    if (!item.GetString("PNPDeviceID", pnp_id).ok() || pnp_id.empty()) {
+      continue;
+    }
+
+    // LocationInformation for PCI devices reads
+    // "PCI bus X, device Y, function Z"; non-PCI adapters report other
+    // strings ("Location Bus Number..." or empty), which are skipped.
+    std::string location;
+    if (!item.GetString("LocationInformation", location).ok() ||
+        location.empty()) {
+      continue;
+    }
+
+    unsigned long bus = 0;
+    unsigned long device = 0;
+    unsigned long function = 0;
+    if (std::sscanf(location.c_str(),
+                    "PCI bus %lu, device %lu, function %lu",
+                    &bus,
+                    &device,
+                    &function) != 3) {
+      continue;
+    }
+
+    char address[16];
+    std::snprintf(address,
+                  sizeof(address),
+                  "0000:%02lx:%02lx.%lu",
+                  bus,
+                  device,
+                  function);
+    addresses[pnp_id] = address;
+  }
+
+  return addresses;
 }
 
 } // namespace
@@ -63,10 +113,11 @@ QueryData genGpuInfo(QueryContext& context) {
     return results;
   }
 
+  const auto address_by_pnp_id = pciAddressByPnpId();
+
   std::int32_t device_id = 0;
   for (const auto& wmiResult : wmiReq->results()) {
     Row r;
-    r["device_id"] = "GPU" + std::to_string(device_id++);
 
     std::string pnp_device_id;
     wmiResult.GetString("PNPDeviceID", pnp_device_id);
@@ -82,9 +133,22 @@ QueryData genGpuInfo(QueryContext& context) {
       r["model_id"] = model_id;
     }
 
-    // pci_slot: use the PNPDeviceID location portion (e.g. PCI\VEN_...&BUS_...)
-    if (!pnp_device_id.empty()) {
-      r["pci_slot"] = pnp_device_id;
+    // pci_slot: the PCI bus address in the same format as Linux
+    // (e.g. "0000:01:00.0"), resolved via Win32_PnPEntity.LocationInformation.
+    // Non-PCI adapters (ROOT\BasicDisplay, virtual adapters) have no PCI
+    // location and leave the column empty.
+    auto slot_it = address_by_pnp_id.find(pnp_device_id);
+    if (slot_it != address_by_pnp_id.end()) {
+      r["pci_slot"] = slot_it->second;
+    }
+
+    // device_id: derived from the PCI address so it is stable across reboots;
+    // WMI enumeration order is not guaranteed. The counter is only a fallback
+    // for devices without a slot.
+    if (r["pci_slot"].empty()) {
+      r["device_id"] = "GPU" + std::to_string(device_id++);
+    } else {
+      r["device_id"] = "GPU" + r["pci_slot"];
     }
 
     wmiResult.GetString("Name", r["name"]);

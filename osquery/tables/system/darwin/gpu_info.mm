@@ -7,15 +7,16 @@
  * SPDX-License-Identifier: (Apache-2.0 OR GPL-2.0-only)
  */
 
-#import <AppKit/NSDocument.h>
 #import <Foundation/Foundation.h>
 
 #include <IOKit/IOKitKeys.h>
 #include <IOKit/IOKitLib.h>
 
 #include <cstdio>
+#include <cstring>
 #include <iomanip>
 #include <sstream>
+#include <vector>
 
 #include <osquery/core/core.h>
 #include <osquery/core/tables.h>
@@ -33,15 +34,21 @@ namespace {
 
 const char* kIOAcceleratorClassName = "IOAccelerator";
 
+// An IOKit accelerator node plus the hardware identity of the device it
+// drives, used to match accelerators to system_profiler rows.
 struct IOKitGpuInfo {
   std::string vendor_id;
   std::string model_id;
   std::string model;
   std::string driver;
-  std::uint64_t vram = 0;
   std::uint32_t cores = 0;
-  bool found = false;
+  // PCI vendor/device IDs published by the underlying device node (e.g.
+  // sgx@4000000 on Apple Silicon, IOPCIDevice for discrete GPUs), if any.
+  std::string pci_vendor_id;
+  std::string pci_device_id;
 };
+
+using IOKitGpuInfoList = std::vector<IOKitGpuInfo>;
 
 std::string cfDataToHexString(CFDataRef data) {
   if (data == nullptr) {
@@ -72,17 +79,119 @@ std::uint64_t cfNumberToUint64(CFTypeRef value) {
   return static_cast<std::uint64_t>(n);
 }
 
-// Enrich a row from the IOKit AGXAccelerator node matching the GPU model.
-void enrichFromIOKit(const std::string& model_name, IOKitGpuInfo& info) {
-  auto matching = IOServiceMatching(kIOAcceleratorClassName);
-  if (matching == nullptr) {
-    return;
+// Safely convert an IOKit property that may be either a CFString or a CFData
+// holding a (possibly unterminated) C string. IOKit does not guarantee property
+// types across vendors; on PCI device nodes, "model" is conventionally CFData.
+std::string stringFromIOKitProperty(CFTypeRef value) {
+  if (value == nullptr) {
+    return {};
   }
 
+  auto type_id = CFGetTypeID(value);
+  if (type_id == CFStringGetTypeID()) {
+    return stringFromCFString(static_cast<CFStringRef>(value));
+  }
+
+  if (type_id == CFDataGetTypeID()) {
+    auto data = static_cast<CFDataRef>(value);
+    auto length = CFDataGetLength(data);
+    if (length < 1) {
+      return {};
+    }
+    // The data bytes may not be null terminated; use strnlen against the
+    // CFDataGetLength bound.
+    auto bytes = CFDataGetBytePtr(data);
+    auto* begin = reinterpret_cast<const char*>(bytes);
+    auto str_length = strnlen(begin, static_cast<std::size_t>(length));
+    return std::string(begin, str_length);
+  }
+
+  return {};
+}
+
+// Read the PCI vendor-id / device-id properties of a device node. On Apple
+// Silicon the accelerator node itself carries vendor-id only; the device node
+// (e.g. sgx@4000000) has neither, in which case this returns false and callers
+// fall back to model-based matching.
+bool readPciIdsFromEntry(io_registry_entry_t entry,
+                         std::string& vendor_id,
+                         std::string& device_id) {
+  vendor_id.clear();
+  device_id.clear();
+
+  CFMutableDictionaryRef props = nullptr;
+  auto kr = IORegistryEntryCreateCFProperties(
+      entry, &props, kCFAllocatorDefault, kNilOptions);
+  if (kr != KERN_SUCCESS || props == nullptr) {
+    return false;
+  }
+  UniqueCFMutableDictionaryRef props_ptr(props);
+
+  bool found = false;
+  auto vid = CFDictionaryGetValue(props, CFSTR("vendor-id"));
+  if (vid != nullptr && CFGetTypeID(vid) == CFDataGetTypeID()) {
+    vendor_id = cfDataToHexString(static_cast<CFDataRef>(vid));
+    found = !vendor_id.empty();
+  }
+  auto did = CFDictionaryGetValue(props, CFSTR("device-id"));
+  if (did != nullptr && CFGetTypeID(did) == CFDataGetTypeID()) {
+    device_id = cfDataToHexString(static_cast<CFDataRef>(did));
+  }
+  return found;
+}
+
+// Walk from the accelerator to its parent device node and read the PCI
+// vendor/device identity, falling back to the accelerator's own properties
+// (Apple Silicon accelerators publish vendor-id directly).
+void acceleratorPciIdentity(io_service_t accelerator,
+                            IOKitGpuInfo& info) {
+  io_registry_entry_t parent = 0;
+  if (IORegistryEntryGetParentEntry(accelerator, "IOService", &parent) ==
+          KERN_SUCCESS &&
+      parent != 0) {
+    UniqueIoService parent_ptr(parent);
+    readPciIdsFromEntry(parent, info.pci_vendor_id, info.pci_device_id);
+  }
+
+  if (info.pci_vendor_id.empty()) {
+    // Fall back to the accelerator's own vendor-id (e.g. Apple Silicon).
+    CFMutableDictionaryRef props = nullptr;
+    auto kr = IORegistryEntryCreateCFProperties(
+        accelerator, &props, kCFAllocatorDefault, kNilOptions);
+    if (kr == KERN_SUCCESS && props != nullptr) {
+      UniqueCFMutableDictionaryRef props_ptr(props);
+      auto vid = CFDictionaryGetValue(props, CFSTR("vendor-id"));
+      if (vid != nullptr && CFGetTypeID(vid) == CFDataGetTypeID()) {
+        info.pci_vendor_id = cfDataToHexString(static_cast<CFDataRef>(vid));
+      }
+    }
+  }
+}
+
+// Collect every IOAccelerator node with its properties, so rows can be
+// matched by hardware identity instead of by display name.
+IOKitGpuInfoList collectIOKitGpus() {
+  IOKitGpuInfoList gpus;
+
+  auto matching = IOServiceMatching(kIOAcceleratorClassName);
+  if (matching == nullptr) {
+    return gpus;
+  }
+
+  // kIOMasterPortDefault is deprecated since macOS 12; kIOMainPortDefault is
+  // unavailable before it. The deployment target is 10.15, so select at
+  // compile time and fall back to the deprecated constant on older systems.
+  mach_port_t main_port;
+#ifdef kIOMainPortDefault
+  main_port = kIOMainPortDefault;
+#else
+  main_port = kIOMasterPortDefault;
+#endif
+
   io_iterator_t it = 0;
-  auto kr = IOServiceGetMatchingServices(kIOMasterPortDefault, matching, &it);
+  auto kr = IOServiceGetMatchingServices(main_port, matching, &it);
   if (kr != KERN_SUCCESS) {
-    return;
+    return gpus;
   }
   UniqueIoIterator it_ptr(it);
 
@@ -98,17 +207,11 @@ void enrichFromIOKit(const std::string& model_name, IOKitGpuInfo& info) {
     }
     UniqueCFMutableDictionaryRef props_ptr(props);
 
-    // Match by model property.
-    auto model_cf =
-        static_cast<CFStringRef>(CFDictionaryGetValue(props, CFSTR("model")));
-    if (model_cf == nullptr) {
-      continue;
-    }
-    if (stringFromCFString(model_cf) != model_name) {
-      continue;
-    }
+    IOKitGpuInfo info;
 
-    info.found = true;
+    // model: matched against the row below; may be CFString or CFData.
+    auto model_cf = CFDictionaryGetValue(props, CFSTR("model"));
+    info.model = stringFromIOKitProperty(model_cf);
 
     // vendor-id: CFDataRef, 4 bytes, little-endian.
     auto vendor_id_data =
@@ -119,44 +222,68 @@ void enrichFromIOKit(const std::string& model_name, IOKitGpuInfo& info) {
     }
 
     // driver: IOClass property.
-    auto io_class =
-        static_cast<CFStringRef>(CFDictionaryGetValue(props, CFSTR("IOClass")));
-    if (io_class != nullptr) {
-      info.driver = stringFromCFString(io_class);
-    }
+    info.driver = stringFromIOKitProperty(
+        CFDictionaryGetValue(props, CFSTR("IOClass")));
 
     // model_id: IONameMatched (e.g. "gpu,t6000") identifies the SoC GPU
     // variant. On Apple Silicon there is no PCI device-id; this is the closest
     // hardware identifier.
-    auto name_matched = static_cast<CFStringRef>(
-        CFDictionaryGetValue(props, CFSTR("IONameMatched")));
-    if (name_matched != nullptr) {
-      info.model_id = stringFromCFString(name_matched);
-    }
+    auto name_matched =
+        CFDictionaryGetValue(props, CFSTR("IONameMatched"));
+    info.model_id = stringFromIOKitProperty(name_matched);
 
     // cores: gpu-core-count (CFNumberRef).
-    auto cores_cf = static_cast<CFTypeRef>(
-        CFDictionaryGetValue(props, CFSTR("gpu-core-count")));
+    auto cores_cf = CFDictionaryGetValue(props, CFSTR("gpu-core-count"));
     if (cores_cf != nullptr) {
       info.cores = static_cast<std::uint32_t>(cfNumberToUint64(cores_cf));
     }
 
-    // vram: PerformanceStatistics -> "Alloc system memory" (CFNumberRef).
-    // On Apple Silicon the GPU uses unified memory; "Alloc system memory" is
-    // the amount of system memory currently allocated to the GPU and is the
-    // closest analog to dedicated VRAM.
-    auto perf_stats = static_cast<CFDictionaryRef>(
-        CFDictionaryGetValue(props, CFSTR("PerformanceStatistics")));
-    if (perf_stats != nullptr) {
-      auto alloc_mem = static_cast<CFTypeRef>(
-          CFDictionaryGetValue(perf_stats, CFSTR("Alloc system memory")));
-      if (alloc_mem != nullptr) {
-        info.vram = cfNumberToUint64(alloc_mem);
+    // vram: deliberately not populated from PerformanceStatistics. The only
+    // candidate there, "Alloc system memory", is the memory *currently*
+    // allocated to the GPU and fluctuates with load (verified empirically:
+    // 7.26 GB vs 7.33 GB minutes apart on the same machine). Every other
+    // platform reports fixed capacity in this column; a dynamic value would
+    // surface as a row change on every poll and break diff-based monitoring.
+    // Apple Silicon has no dedicated VRAM, so the column stays empty here;
+    // system_profiler's spdisplays_vram still fills it for discrete GPUs.
+
+    acceleratorPciIdentity(service, info);
+
+    gpus.push_back(std::move(info));
+  }
+
+  return gpus;
+}
+
+// Find the best accelerator for a system_profiler row: prefer a hardware
+// identity match (PCI vendor/device IDs), then fall back to model name. Each
+// accelerator is consumed at most once so two identical cards enrich two
+// different rows instead of the same node twice.
+IOKitGpuInfoList::iterator matchAccelerator(
+    const std::string& model_name,
+    const std::string& sp_vendor_id,
+    const std::string& sp_device_id,
+    IOKitGpuInfoList& gpus) {
+  if (!sp_vendor_id.empty() && !sp_device_id.empty()) {
+    for (auto it = gpus.begin(); it != gpus.end(); ++it) {
+      if (it->pci_vendor_id == sp_vendor_id &&
+          it->pci_device_id == sp_device_id) {
+        return it;
       }
     }
-
-    return;
   }
+
+  if (model_name.empty()) {
+    return gpus.end();
+  }
+
+  for (auto it = gpus.begin(); it != gpus.end(); ++it) {
+    if (it->model == model_name) {
+      return it;
+    }
+  }
+
+  return gpus.end();
 }
 
 std::uint64_t vramBytesFromDict(NSDictionary* item) {
@@ -218,9 +345,13 @@ QueryData genGpuInfo(QueryContext& context) {
     }
 
     std::int32_t device_id = 0;
+
+    // Collect IOKit accelerators once; each row consumes at most one node so
+    // identical GPUs are enriched from distinct accelerators.
+    IOKitGpuInfoList iokit_gpus = collectIOKitGpus();
+
     for (NSDictionary* item in items) {
       Row r;
-      r["device_id"] = "GPU" + std::to_string(device_id++);
 
       std::string model_name;
 
@@ -263,30 +394,51 @@ QueryData genGpuInfo(QueryContext& context) {
         }
       }
 
+      // device_id: derived from the slot when present so it is stable across
+      // reboots; system_profiler enumeration order is not guaranteed. The
+      // counter is only a fallback for rows without one (e.g. Apple Silicon
+      // integrated GPUs).
+      if (r["pci_slot"].empty()) {
+        r["device_id"] = "GPU" + std::to_string(device_id++);
+      } else {
+        r["device_id"] = "GPU" + r["pci_slot"];
+      }
+
       r["pci_class_id"] = "0x030000";
 
+      // Hardware identity from system_profiler, used to match the row to its
+      // IOKit accelerator. Discrete GPUs report hex PCI ids (e.g.
+      // "0x1002" / "0x679e"); Apple Silicon does not report them.
+      std::string sp_vendor_id;
+      std::string sp_device_id;
+      if (id sp_vid = [item valueForKey:@"sppci_vendor_id"]) {
+        sp_vendor_id = [[sp_vid description] UTF8String];
+      }
+      if (id sp_did = [item valueForKey:@"sppci_device_id"]) {
+        sp_device_id = [[sp_did description] UTF8String];
+      }
+
       // Enrich from IOKit AGXAccelerator for Apple Silicon (and discrete GPUs
-      // that publish an IOAccelerator personality).
-      if (!model_name.empty()) {
-        IOKitGpuInfo iokit_info;
-        enrichFromIOKit(model_name, iokit_info);
-        if (iokit_info.found) {
-          if (r["vendor_id"].empty()) {
-            r["vendor_id"] = iokit_info.vendor_id;
-          }
-          if (r["model_id"].empty()) {
-            r["model_id"] = iokit_info.model_id;
-          }
-          if (r["driver"].empty()) {
-            r["driver"] = iokit_info.driver;
-          }
-          if (r["vram"].empty()) {
-            r["vram"] = BIGINT(iokit_info.vram);
-          }
-          if (iokit_info.cores > 0) {
-            r["cores"] = INTEGER(iokit_info.cores);
-          }
+      // that publish an IOAccelerator personality), matched by hardware
+      // identity when available.
+      auto accel_it =
+          matchAccelerator(model_name, sp_vendor_id, sp_device_id, iokit_gpus);
+      if (accel_it != iokit_gpus.end()) {
+        const auto& iokit_info = *accel_it;
+        if (r["vendor_id"].empty() && !iokit_info.vendor_id.empty()) {
+          r["vendor_id"] = iokit_info.vendor_id;
         }
+        if (r["model_id"].empty() && !iokit_info.model_id.empty()) {
+          r["model_id"] = iokit_info.model_id;
+        }
+        if (r["driver"].empty() && !iokit_info.driver.empty()) {
+          r["driver"] = iokit_info.driver;
+        }
+        if (iokit_info.cores > 0) {
+          r["cores"] = INTEGER(iokit_info.cores);
+        }
+        // Consume this accelerator so no other row matches it.
+        iokit_gpus.erase(accel_it);
       }
 
       // metal_support from system_profiler.

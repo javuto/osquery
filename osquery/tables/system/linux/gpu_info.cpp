@@ -7,7 +7,9 @@
  * SPDX-License-Identifier: (Apache-2.0 OR GPL-2.0-only)
  */
 
+#include <cstring>
 #include <fstream>
+#include <string_view>
 
 #include <boost/algorithm/string.hpp>
 #include <boost/algorithm/string/trim.hpp>
@@ -60,7 +62,10 @@ void collectVramFromDrm(std::map<std::string, std::uint64_t>& vram_by_slot) {
   }
 
   for (const auto& entry : drm_entries) {
-    if (entry.find("card") == std::string::npos ||
+    // Select card0, card1, ... only: prefix-match "card" and exclude
+    // connector entries (card0-eDP-1) and other hyphenated names. The
+    // explicit render check excludes renderD* siblings.
+    if (entry.rfind("card", 0) != 0 ||
         entry.find("render") != std::string::npos ||
         entry.find("-") != std::string::npos) {
       continue;
@@ -92,7 +97,7 @@ void collectVramFromDrm(std::map<std::string, std::uint64_t>& vram_by_slot) {
     auto uevent = readSysFile(slot_path);
     for (const auto& line : split(uevent, "\n")) {
       if (line.find("PCI_SLOT_NAME=") == 0) {
-        slot = line.substr(strlen("PCI_SLOT_NAME="));
+        slot = line.substr(std::string_view("PCI_SLOT_NAME=").size());
         boost::trim(slot);
         break;
       }
@@ -207,8 +212,15 @@ QueryData genGpuInfo(QueryContext& context) {
     }
 
     Row r;
-    r["device_id"] = "GPU" + std::to_string(device_id++);
     r["pci_slot"] = UdevEventPublisher::getValue(device.get(), kPCIKeySlot);
+    // device_id: derived from the PCI address so it is stable across reboots;
+    // udev enumeration order is not guaranteed. The counter is only a fallback
+    // for devices without a slot.
+    if (r["pci_slot"].empty()) {
+      r["device_id"] = "GPU" + std::to_string(device_id++);
+    } else {
+      r["device_id"] = "GPU" + r["pci_slot"];
+    }
     r["pci_class_id"] = "0x" + pci_class_attr;
     r["driver"] = UdevEventPublisher::getValue(device.get(), kPCIKeyDriver);
 
