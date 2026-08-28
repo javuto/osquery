@@ -143,8 +143,7 @@ bool readPciIdsFromEntry(io_registry_entry_t entry,
 // Walk from the accelerator to its parent device node and read the PCI
 // vendor/device identity, falling back to the accelerator's own properties
 // (Apple Silicon accelerators publish vendor-id directly).
-void acceleratorPciIdentity(io_service_t accelerator,
-                            IOKitGpuInfo& info) {
+void acceleratorPciIdentity(io_service_t accelerator, IOKitGpuInfo& info) {
   io_registry_entry_t parent = 0;
   if (IORegistryEntryGetParentEntry(accelerator, "IOService", &parent) ==
           KERN_SUCCESS &&
@@ -222,14 +221,13 @@ IOKitGpuInfoList collectIOKitGpus() {
     }
 
     // driver: IOClass property.
-    info.driver = stringFromIOKitProperty(
-        CFDictionaryGetValue(props, CFSTR("IOClass")));
+    info.driver =
+        stringFromIOKitProperty(CFDictionaryGetValue(props, CFSTR("IOClass")));
 
     // model_id: IONameMatched (e.g. "gpu,t6000") identifies the SoC GPU
     // variant. On Apple Silicon there is no PCI device-id; this is the closest
     // hardware identifier.
-    auto name_matched =
-        CFDictionaryGetValue(props, CFSTR("IONameMatched"));
+    auto name_matched = CFDictionaryGetValue(props, CFSTR("IONameMatched"));
     info.model_id = stringFromIOKitProperty(name_matched);
 
     // cores: gpu-core-count (CFNumberRef).
@@ -259,11 +257,10 @@ IOKitGpuInfoList collectIOKitGpus() {
 // identity match (PCI vendor/device IDs), then fall back to model name. Each
 // accelerator is consumed at most once so two identical cards enrich two
 // different rows instead of the same node twice.
-IOKitGpuInfoList::iterator matchAccelerator(
-    const std::string& model_name,
-    const std::string& sp_vendor_id,
-    const std::string& sp_device_id,
-    IOKitGpuInfoList& gpus) {
+IOKitGpuInfoList::iterator matchAccelerator(const std::string& model_name,
+                                            const std::string& sp_vendor_id,
+                                            const std::string& sp_device_id,
+                                            IOKitGpuInfoList& gpus) {
   if (!sp_vendor_id.empty() && !sp_device_id.empty()) {
     for (auto it = gpus.begin(); it != gpus.end(); ++it) {
       if (it->pci_vendor_id == sp_vendor_id &&
