@@ -26,8 +26,8 @@ namespace {
 // Parse a PNPDeviceID like "PCI\VEN_10DE&DEV_1B81&SUBSYS_..." to extract the
 // vendor and device (model) IDs.
 void parsePnpDeviceId(const std::string& pnp_id,
-                       std::string& vendor_id,
-                       std::string& model_id) {
+                      std::string& vendor_id,
+                      std::string& model_id) {
   vendor_id.clear();
   model_id.clear();
 

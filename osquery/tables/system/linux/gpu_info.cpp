@@ -72,7 +72,8 @@ void collectVramFromDrm(std::map<std::string, std::uint64_t>& vram_by_slot) {
     }
 
     std::string vram;
-    auto mem_info_vram_total = readSysFile(device_path + "/mem_info_vram_total");
+    auto mem_info_vram_total =
+        readSysFile(device_path + "/mem_info_vram_total");
     if (!mem_info_vram_total.empty()) {
       vram = mem_info_vram_total;
     }
@@ -103,7 +104,8 @@ void collectVramFromDrm(std::map<std::string, std::uint64_t>& vram_by_slot) {
   }
 }
 
-void enrichVram(Row& row, const std::map<std::string, std::uint64_t>& vram_by_slot) {
+void enrichVram(Row& row,
+                const std::map<std::string, std::uint64_t>& vram_by_slot) {
   auto slot_it = row.find("pci_slot");
   if (slot_it == row.end() || slot_it->second.empty()) {
     return;
@@ -206,8 +208,7 @@ QueryData genGpuInfo(QueryContext& context) {
 
     Row r;
     r["device_id"] = "GPU" + std::to_string(device_id++);
-    r["pci_slot"] =
-        UdevEventPublisher::getValue(device.get(), kPCIKeySlot);
+    r["pci_slot"] = UdevEventPublisher::getValue(device.get(), kPCIKeySlot);
     r["pci_class_id"] = "0x" + pci_class_attr;
     r["driver"] = UdevEventPublisher::getValue(device.get(), kPCIKeyDriver);
 

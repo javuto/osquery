@@ -10,8 +10,8 @@
 #import <AppKit/NSDocument.h>
 #import <Foundation/Foundation.h>
 
-#include <IOKit/IOKitLib.h>
 #include <IOKit/IOKitKeys.h>
+#include <IOKit/IOKitLib.h>
 
 #include <cstdio>
 #include <iomanip>
@@ -291,9 +291,8 @@ QueryData genGpuInfo(QueryContext& context) {
 
       // metal_support from system_profiler.
       if (id metal = [item valueForKey:@"spdisplays_mtlgpufamilysupport"]) {
-        r["metal_support"] =
-            SQL_TEXT(stripPrefix([[metal description] UTF8String],
-                                 "spdisplays_"));
+        r["metal_support"] = SQL_TEXT(
+            stripPrefix([[metal description] UTF8String], "spdisplays_"));
       }
 
       results.push_back(r);
