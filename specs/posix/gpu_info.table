@@ -1,0 +1,23 @@
+table_name("gpu_info")
+description("Retrieve GPU (graphics processing unit) information of the machine.")
+schema([
+    Column("device_id", TEXT, "The DeviceID of the GPU."),
+    Column("name", TEXT, "The name of the GPU."),
+    Column("vendor", TEXT, "The vendor of the GPU."),
+    Column("vendor_id", TEXT, "The hex encoded PCI vendor identifier of the GPU."),
+    Column("model", TEXT, "The model of the GPU."),
+    Column("model_id", TEXT, "The hex encoded PCI model identifier of the GPU."),
+    Column("driver", TEXT, "The driver in use by the GPU."),
+    Column("vram", BIGINT, "The total video memory of the GPU in bytes."),
+    Column("pci_slot", TEXT, "The PCI slot of the GPU."),
+    Column("pci_class_id", TEXT, "The PCI class identifier of the GPU in hex format."),
+])
+extended_schema(DARWIN, [
+    Column("cores", INTEGER, "The number of GPU cores. Only available on macOS."),
+    Column("metal_support", TEXT, "The Metal feature set supported by the GPU. Only available on macOS."),
+])
+extended_schema(WINDOWS, [
+    Column("driver_version", TEXT, "The version of the installed driver. Only available on Windows."),
+    Column("driver_date", BIGINT, "The date of the installed driver, as a Unix timestamp. Only available on Windows."),
+])
+implementation("gpu_info@genGpuInfo")
