@@ -31,6 +31,22 @@ namespace {
 
 const std::string kDrmSysfsPath = "/sys/class/drm";
 
+// udev property names for PCI device attributes; these mirror the constants
+// in pci_devices.cpp, which are not exported through a header.
+const std::string kPCIClassID = "PCI_CLASS";
+const std::string kPCIKeySlot = "PCI_SLOT_NAME";
+const std::string kPCIKeyDriver = "DRIVER";
+const std::string kPCIKeyID = "PCI_ID";
+const std::string kPCISubsysID = "PCI_SUBSYS_ID";
+const std::string kPCIKeyVendor = "ID_VENDOR_FROM_DATABASE";
+const std::string kPCIKeyModel = "ID_MODEL_FROM_DATABASE";
+
+// Candidate locations of the pci.ids database; mirrors the constant in
+// pci_devices.cpp, which is not exported through a header.
+const std::vector<std::string> kPciidsPathList{"/usr/share/misc/pci.ids",
+                                               "/usr/share/hwdata/pci.ids",
+                                               "/usr/share/pci.ids"};
+
 std::string readSysFile(const std::string& path) {
   std::string content;
   if (!readFile(path, content).ok()) {
