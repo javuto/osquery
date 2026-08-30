@@ -7,8 +7,11 @@
  * SPDX-License-Identifier: (Apache-2.0 OR GPL-2.0-only)
  */
 
+#include <cstdint>
 #include <cstring>
+#include <dlfcn.h>
 #include <fstream>
+#include <memory>
 #include <string_view>
 
 #include <boost/algorithm/string.hpp>
@@ -136,6 +139,160 @@ void enrichVram(Row& row,
   if (vram_it != vram_by_slot.end()) {
     row["vram"] = BIGINT(vram_it->second);
   }
+}
+
+// NVML is the NVIDIA Management Library, the interface behind nvidia-smi.
+// The proprietary driver exposes no sysfs file with the video memory size, so
+// the fixed capacity of NVIDIA GPUs is read from NVML instead. The library is
+// part of the driver userland, ships with no stable header to build against
+// and is absent on non-NVIDIA systems, so it is opened dynamically at query
+// time and every failure is tolerated: the vram column stays empty.
+const std::vector<std::string> kNvmlLibraryNames{"libnvidia-ml.so.1",
+                                                 "libnvidia-ml.so"};
+
+// Mirrors nvmlMemory_t from NVIDIA's nvml.h. Only the layout matters, and
+// only the first field is consumed: total is the physical VRAM capacity.
+struct NvmlMemory {
+  std::uint64_t total;
+  std::uint64_t free;
+  std::uint64_t used;
+};
+
+// The two nvmlReturn_t values compared directly; every other result is only
+// passed to nvmlErrorString. NVML_SUCCESS has been 0 in every NVML release.
+enum NvmlResult {
+  kNvmlSuccess = 0,
+  kNvmlErrorNotFound = 6,
+};
+
+extern "C" {
+typedef int (*NvmlInitFn)();
+typedef int (*NvmlShutdownFn)();
+typedef const char* (*NvmlErrorStringFn)(int result);
+typedef int (*NvmlGetHandleByPciBusIdFn)(const char* pci_bus_id, void** device);
+typedef int (*NvmlGetMemoryInfoFn)(void* device, NvmlMemory* memory);
+}
+
+// The NVML symbols resolved from the dynamically opened library, plus the
+// dlopen handle they came from.
+struct NvmlApi {
+  void* library{nullptr};
+
+  NvmlInitFn init{nullptr};
+  NvmlShutdownFn shutdown{nullptr};
+  NvmlErrorStringFn error_string{nullptr};
+  NvmlGetHandleByPciBusIdFn get_handle_by_pci_bus_id{nullptr};
+  NvmlGetMemoryInfoFn get_memory_info{nullptr};
+};
+
+struct NvmlApiCloser {
+  void operator()(NvmlApi* api) const {
+    if (api != nullptr && api->library != nullptr) {
+      dlclose(api->library);
+    }
+    delete api;
+  }
+};
+
+using NvmlApiPtr = std::unique_ptr<NvmlApi, NvmlApiCloser>;
+
+NvmlApiPtr loadNvmlApi() {
+  for (const auto& library_name : kNvmlLibraryNames) {
+    auto library = dlopen(library_name.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (library == nullptr) {
+      VLOG(1) << "NVML is not available: " << dlerror();
+      continue;
+    }
+
+    auto api = NvmlApiPtr(new NvmlApi());
+    api->library = library;
+    api->init = reinterpret_cast<NvmlInitFn>(dlsym(library, "nvmlInit_v2"));
+    api->shutdown =
+        reinterpret_cast<NvmlShutdownFn>(dlsym(library, "nvmlShutdown"));
+    api->error_string =
+        reinterpret_cast<NvmlErrorStringFn>(dlsym(library, "nvmlErrorString"));
+    api->get_handle_by_pci_bus_id = reinterpret_cast<NvmlGetHandleByPciBusIdFn>(
+        dlsym(library, "nvmlDeviceGetHandleByPciBusId_v2"));
+    api->get_memory_info = reinterpret_cast<NvmlGetMemoryInfoFn>(
+        dlsym(library, "nvmlDeviceGetMemoryInfo"));
+
+    if (api->init == nullptr || api->shutdown == nullptr ||
+        api->error_string == nullptr ||
+        api->get_handle_by_pci_bus_id == nullptr ||
+        api->get_memory_info == nullptr) {
+      VLOG(1) << "NVML at " << library_name
+              << " is missing required symbols, NVIDIA GPUs cannot be queried";
+      continue;
+    }
+
+    return api;
+  }
+
+  return nullptr;
+}
+
+// Fills the vram column of the rows that could not be read from sysfs and
+// that have a PCI address NVML can be queried with. NVML addresses GPUs by
+// PCI bus id in the same domain:bus:device.function form udev reports in
+// PCI_SLOT_NAME, so each row is looked up by its own slot and identical GPUs
+// cannot be confused.
+void enrichVramFromNvml(QueryData& results) {
+  std::vector<Row*> gpus_without_vram;
+  for (auto& row : results) {
+    auto vram_it = row.find("vram");
+    bool has_vram = vram_it != row.end() && !vram_it->second.empty();
+    auto slot_it = row.find("pci_slot");
+    bool has_slot = slot_it != row.end() && !slot_it->second.empty();
+
+    if (!has_vram && has_slot) {
+      gpus_without_vram.push_back(&row);
+    }
+  }
+
+  if (gpus_without_vram.empty()) {
+    return;
+  }
+
+  auto nvml = loadNvmlApi();
+  if (nvml == nullptr) {
+    return;
+  }
+
+  auto result = nvml->init();
+  if (result != kNvmlSuccess) {
+    VLOG(1) << "Cannot initialize NVML: " << nvml->error_string(result);
+    return;
+  }
+
+  for (auto* row : gpus_without_vram) {
+    const auto& pci_slot = row->at("pci_slot");
+
+    void* device = nullptr;
+    result = nvml->get_handle_by_pci_bus_id(pci_slot.c_str(), &device);
+    if (result == kNvmlErrorNotFound) {
+      // No NVIDIA GPU at this slot.
+      continue;
+    }
+    if (result != kNvmlSuccess) {
+      VLOG(1) << "NVML cannot access the GPU at PCI slot " << pci_slot << ": "
+              << nvml->error_string(result);
+      continue;
+    }
+
+    NvmlMemory memory{};
+    result = nvml->get_memory_info(device, &memory);
+    if (result != kNvmlSuccess) {
+      VLOG(1) << "NVML cannot read the memory of the GPU at PCI slot "
+              << pci_slot << ": " << nvml->error_string(result);
+      continue;
+    }
+
+    if (memory.total > 0) {
+      (*row)["vram"] = BIGINT(memory.total);
+    }
+  }
+
+  nvml->shutdown();
 }
 
 bool isDisplayControllerClass(const std::string& pci_class_attr) {
@@ -269,6 +426,9 @@ QueryData genGpuInfo(QueryContext& context) {
 
     results.emplace_back(std::move(r));
   }
+
+  // The DRM sysfs files only cover AMD GPUs; NVML fills in NVIDIA ones.
+  enrichVramFromNvml(results);
 
   return results;
 }
