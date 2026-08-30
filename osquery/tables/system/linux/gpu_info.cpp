@@ -296,28 +296,33 @@ void enrichVramFromNvml(QueryData& results) {
 }
 
 bool isDisplayControllerClass(const std::string& pci_class_attr) {
+  // udev reports PCI_CLASS as the 24-bit class code, hex, WITHOUT the 0x
+  // prefix and with insignificant leading zeroes stripped (e.g. display is
+  // "30000" == 0x030000). The display controller base class is 0x03.
   std::string lowered = pci_class_attr;
   boost::algorithm::to_lower(lowered);
   boost::trim(lowered);
 
-  if (lowered.size() < 2) {
+  // Strip an optional 0x prefix.
+  if (lowered.rfind("0x", 0) == 0) {
+    lowered = lowered.substr(2);
+  }
+
+  if (lowered.empty()) {
     return false;
   }
 
-  std::string class_id;
-  switch (lowered.size()) {
-  case 5:
-    class_id = lowered.substr(0, 1);
-    break;
-  case 6:
-  case 7:
-    class_id = lowered.substr(0, 2);
-    break;
-  default:
-    return false;
+  // The class code is 0xRRCCSS: base class RR is the leading byte. With
+  // leading zeroes stripped, RR==0x03 appears as either "3" (id_len 5) or
+  // "03" (id_len 6).
+  std::string base;
+  if (lowered[0] == '0' && lowered.size() >= 2) {
+    base = lowered.substr(0, 2); // "03xxxx" -> "03"
+  } else {
+    base = lowered.substr(0, 1); // "3xxxx" -> "3"
   }
 
-  return class_id == "03";
+  return (base == "03" || base == "3");
 }
 
 } // namespace
